@@ -100,7 +100,7 @@ func (store *MessageStore) Close() error {
 
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
-	if IsBlocked(jid, name) {
+	if IsBlocked(jid) {
 		return nil
 	}
 	_, err := store.db.Exec(
@@ -113,7 +113,7 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
-	if IsBlocked(chatJID, "") {
+	if IsBlocked(chatJID) {
 		return nil
 	}
 
@@ -421,18 +421,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
 
-	// Skip blocked chats before name lookup, which logs the chat
-	if chatBlocked(client, msg.Info.Chat, "") {
+	// Skip blocked chats entirely, before the name lookup (which logs the
+	// chat): nothing is stored or printed
+	if chatBlocked(client, msg.Info.Chat) {
 		return
 	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
-
-	// Skip blocked chats entirely: nothing is stored or printed
-	if chatBlocked(client, msg.Info.Chat, name) {
-		return
-	}
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -579,12 +575,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// Refuse to download media from blocked chats
-	var chatName string
-	messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&chatName)
-	if IsBlocked(chatJID, chatName) {
+	if IsBlocked(chatJID) {
 		return false, "", "", "", fmt.Errorf("chat is blocked")
 	}
-	if jid, err := types.ParseJID(chatJID); err == nil && chatBlocked(client, jid, chatName) {
+	if jid, err := types.ParseJID(chatJID); err == nil && chatBlocked(client, jid) {
 		return false, "", "", "", fmt.Errorf("chat is blocked")
 	}
 
@@ -990,24 +984,18 @@ func contactNames(client *whatsmeow.Client, jid types.JID) []string {
 	return names
 }
 
-// chatBlocked checks a chat against the blocklist by its JID and name, and for
-// 1:1 chats also by its LID/phone-number alias and the person's contact names.
-// This catches chats keyed by a LID, which a phone-number or name entry would
-// otherwise miss.
-func chatBlocked(client *whatsmeow.Client, jid types.JID, name string) bool {
-	if IsBlocked(jid.String(), name) {
+// chatBlocked checks a chat against the blocklist by its JID and, for 1:1
+// chats, by its LID/phone-number alias, so an entry for either form blocks the
+// chat. Display names are never used.
+func chatBlocked(client *whatsmeow.Client, jid types.JID) bool {
+	if IsBlocked(jid.String()) {
 		return true
 	}
 	if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
 		return false
 	}
 	for _, j := range contactJIDs(client, jid)[1:] {
-		if IsBlocked(j.String(), name) {
-			return true
-		}
-	}
-	for _, n := range contactNames(client, jid) {
-		if IsBlocked(jid.String(), n) {
+		if IsBlocked(j.String()) {
 			return true
 		}
 	}
@@ -1116,18 +1104,13 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
-		// Skip blocked chats before name lookup, which logs the chat
-		if chatBlocked(client, jid, "") {
+		// Skip blocked chats entirely, before the name lookup (which logs the chat)
+		if chatBlocked(client, jid) {
 			continue
 		}
 
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
-
-		// Skip blocked chats entirely
-		if chatBlocked(client, jid, name) {
-			continue
-		}
 
 		// Process messages
 		messages := conversation.Messages

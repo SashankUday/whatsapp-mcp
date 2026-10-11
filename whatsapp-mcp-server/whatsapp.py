@@ -420,7 +420,7 @@ def search_contacts(query: str) -> List[Contact]:
             if not key or key in seen:
                 continue
             seen.add(key)
-            if any(j in blocked or is_blocked(j, name, resolver) for j in (pn, lid) if j):
+            if any(j in blocked or is_blocked(j, resolver) for j in (pn, lid) if j):
                 continue
             result.append(Contact(
                 phone_number=split_jid(pn)[0] if pn else "",
@@ -553,7 +553,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         cursor.execute(query, (chat_jid,))
         chat_data = cursor.fetchone()
         
-        if not chat_data or is_blocked(chat_data[0], chat_data[1], resolver):
+        if not chat_data or is_blocked(chat_data[0], resolver):
             return None
             
         return _chat_from_row(chat_data, resolver)
@@ -708,19 +708,8 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
         return False, f"Unexpected error: {str(e)}"
 
 def _chat_is_blocked(chat_jid: str) -> bool:
-    """Check a chat JID against the blocklist, including its stored chat name."""
-    name = None
-    try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
-        row = conn.execute("SELECT name FROM chats WHERE jid = ?", (chat_jid,)).fetchone()
-        if row:
-            name = row[0]
-    except sqlite3.Error as e:
-        print(f"Database error while checking blocklist: {e}")
-    finally:
-        if 'conn' in locals():
-            conn.close()
-    return is_blocked(chat_jid, name, _resolver())
+    """Check a chat JID, and its LID/phone alias, against the blocklist."""
+    return is_blocked(chat_jid, _resolver())
 
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path.
