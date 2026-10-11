@@ -171,7 +171,7 @@ func handleReceipt(client *whatsmeow.Client, store *MessageStore, receipt *event
 	default:
 		return
 	}
-	if chatBlocked(client, receipt.Chat) {
+	if chatBlockedWithAliases(client, receipt.Chat, messageChatAliases(receipt.MessageSource)...) {
 		return
 	}
 	chats := chatJIDStrings(client, receipt.Chat)

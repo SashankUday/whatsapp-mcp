@@ -28,6 +28,8 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	waStore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -442,7 +444,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Skip blocked chats entirely, before the name lookup (which logs the
 	// chat): nothing is stored or printed
-	if chatBlocked(client, msg.Info.Chat) {
+	if chatBlockedWithAliases(client, msg.Info.Chat, messageChatAliases(msg.Info.MessageSource)...) {
 		return
 	}
 
@@ -944,6 +946,9 @@ func main() {
 	listGroups := flag.Bool("list-groups", false, "print the ID and name of every joined group, then exit (use it to find group IDs for blocklist.txt)")
 	flag.Parse()
 
+	// Name shown for this device in the phone's Linked devices list (set at pairing)
+	waStore.DeviceProps.Os = proto.String("WhatsApp MCP")
+
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
@@ -1159,6 +1164,76 @@ func chatBlocked(client *whatsmeow.Client, jid types.JID) bool {
 	return false
 }
 
+// chatBlockedWithAliases is chatBlocked plus any alias the event itself
+// carries for a 1:1 chat (a live message's sender/recipient alt, a history sync
+// conversation's phone/LID JID). Blocking then doesn't depend on whatsmeow
+// having stored the LID mapping yet: on a fresh pairing it stores history-sync
+// mappings in the background, possibly after the event reaches us.
+func chatBlockedWithAliases(client *whatsmeow.Client, jid types.JID, aliases ...types.JID) bool {
+	if chatBlocked(client, jid) {
+		return true
+	}
+	jid = normalizeUserJID(jid)
+	if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
+		return false
+	}
+	for _, alias := range append([]types.JID{jid}, aliases...) {
+		alias = normalizeUserJID(alias)
+		if alias.IsEmpty() || (alias.Server != types.DefaultUserServer && alias.Server != types.HiddenUserServer) {
+			continue
+		}
+		if chatBlocked(client, alias) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeUserJID drops any device part and maps the legacy c.us server to
+// s.whatsapp.net, as whatsmeow does when it stores history-sync mappings.
+func normalizeUserJID(jid types.JID) types.JID {
+	jid = jid.ToNonAD()
+	if jid.Server == types.LegacyUserServer {
+		jid.Server = types.DefaultUserServer
+	}
+	return jid
+}
+
+// messageChatAliases returns the alternative address of a 1:1 chat carried
+// by a message or receipt: the sender's alt for incoming, the recipient's for
+// outgoing.
+func messageChatAliases(src types.MessageSource) []types.JID {
+	if src.IsGroup {
+		return nil
+	}
+	return []types.JID{src.SenderAlt, src.RecipientAlt}
+}
+
+// historyChatAliases returns the phone/LID aliases a history sync carries for
+// a conversation: its own PN/LID JID fields and the sync's mapping list.
+func historyChatAliases(jid types.JID, conversation *waHistorySync.Conversation, pnToLID map[string]string) []types.JID {
+	var aliases []types.JID
+	for _, s := range []string{conversation.GetPnJID(), conversation.GetLidJID()} {
+		if alias, err := types.ParseJID(s); err == nil && s != "" {
+			aliases = append(aliases, alias)
+		}
+	}
+	key := normalizeUserJID(jid).String()
+	if lid, ok := pnToLID[key]; ok {
+		if alias, err := types.ParseJID(lid); err == nil {
+			aliases = append(aliases, alias)
+		}
+	}
+	for pn, lid := range pnToLID {
+		if lid == key {
+			if alias, err := types.ParseJID(pn); err == nil {
+				aliases = append(aliases, alias)
+			}
+		}
+	}
+	return aliases
+}
+
 // printJoinedGroups prints "<group JID>\t<name>" for every joined group, sorted by name.
 func printJoinedGroups(client *whatsmeow.Client, logger waLog.Logger) {
 	groups, err := client.GetJoinedGroups(context.Background())
@@ -1258,6 +1333,16 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
 
+	// Phone number <-> LID pairs carried by this sync, for the blocklist check
+	pnToLID := map[string]string{}
+	for _, m := range historySync.Data.GetPhoneNumberToLidMappings() {
+		pn, errPN := types.ParseJID(m.GetPnJID())
+		lid, errLID := types.ParseJID(m.GetLidJID())
+		if errPN == nil && errLID == nil && !pn.IsEmpty() && !lid.IsEmpty() {
+			pnToLID[normalizeUserJID(pn).String()] = normalizeUserJID(lid).String()
+		}
+	}
+
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
 		// Parse JID from the conversation
@@ -1274,8 +1359,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
-		// Skip blocked chats entirely, before the name lookup (which logs the chat)
-		if chatBlocked(client, jid) {
+		// Skip blocked chats entirely, before the name lookup (which logs the
+		// chat) and before any write: chat row, messages or read state
+		if chatBlockedWithAliases(client, jid, historyChatAliases(jid, conversation, pnToLID)...) {
 			continue
 		}
 
