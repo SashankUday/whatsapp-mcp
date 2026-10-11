@@ -3,3 +3,6 @@ claude_desktop_config.json
 whatsapp.log
 # Personal chat blocklist (see blocklist.example.txt)
 blocklist.txt
+
+# Bridge data: WhatsApp session keys, message database, downloaded media
+whatsapp-bridge/store/
