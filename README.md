@@ -201,6 +201,33 @@ Your own messages still show as "Me". Messages returned by `get_message_context`
 
 Restart the MCP server (for Claude Desktop, quit and reopen it) to pick up these changes. Restart the bridge too: it then gives LID-keyed 1:1 chats real names when it stores them, and applies the LID/phone-aware blocking above before storing anything. Restarting the bridge does not require pairing again.
 
+## Read state
+
+The bridge tracks which messages you have read, so "unread" in the MCP tools matches what your phone shows. Each stored message is `read`, `unread` or `unknown`:
+
+- Messages you send are read. Messages received while the bridge is running start unread.
+- When you read messages on your phone or another device, WhatsApp sends your linked devices a read receipt (`read`, or `read-self` if your read receipts are off). The bridge marks those messages read.
+- Marking a whole chat as read on another device marks everything up to that moment read. Marking a chat as unread sets a `marked_unread` flag on the chat; it doesn't change individual messages.
+- A history sync (when the bridge is first linked) carries an unread count per chat. The newest that many incoming messages are marked unread and older ones read. This is an approximation, since the count can include messages the bridge doesn't store, such as reactions.
+
+Limits:
+
+- Read state is only tracked while the bridge is running and connected. Receipts that arrive while it is stopped are usually delivered when it reconnects, but this isn't guaranteed.
+- Messages stored before this feature was added are `unknown`, because the bridge never recorded their read state, and they are left out of unread listings. They become read if you mark their chat read on your phone.
+- Blocked chats are skipped entirely: no read state, unread count or activity is recorded or shown for them.
+
+Tools:
+
+- `list_messages` tags each message `[read]`, `[unread]` or `[unknown]`, and has an `unread_only` option. `list_chats` and `get_chat` include `unread_count` and `marked_unread`.
+- `list_unread_messages` returns unread messages across chats, grouped by chat, oldest first.
+
+There are two ways to clear messages, and they are very different:
+
+- **`dismiss_messages`** (local only): sets a "dismissed" flag in `messages.db`, so messages drop out of unread listings. Nothing is sent to WhatsApp, the messages stay unread on your phone, and nobody is notified. Undo with `undo=true`. Use this for triage.
+- **`mark_read_on_whatsapp`** (sends read receipts): marks messages read on WhatsApp itself, so your phone and other devices show them as read. If your read receipts are on, senders may see blue ticks. It works in two steps: the first call is a dry run that reports how many messages per chat would be marked and returns a token that expires after five minutes. Only a second call with that token sends anything. It refuses blocked chats and handles one chat per call unless you list several and set `confirm_multiple_chats`.
+
+When you first run a bridge with read-state tracking, it backs up `store/messages.db` (to `store/messages.db.pre-read-state-<time>.bak`) before adding the new columns. Your WhatsApp session is untouched, so you don't need to pair again.
+
 ## Technical Details
 
 1. Claude sends requests to the Python MCP server
