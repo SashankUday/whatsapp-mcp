@@ -15,8 +15,32 @@ from names import NameResolver, split_jid, normalise_number
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 # The bridge only listens on 127.0.0.1. Never route its calls through a proxy.
 WHATSAPP_API_BASE_URL = "http://127.0.0.1:8080/api"
+# Shared secret the bridge creates on first start; every API call must send it
+BRIDGE_TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'api-token')
 _bridge = requests.Session()
 _bridge.trust_env = False
+
+
+class BridgeTokenError(requests.RequestException):
+    """The bridge's API token is missing or unreadable."""
+
+
+def _bridge_token() -> str:
+    """Read the API token fresh each call, so a rotated token is picked up."""
+    try:
+        with open(BRIDGE_TOKEN_PATH) as f:
+            token = f.read().strip()
+    except OSError as e:
+        raise BridgeTokenError(f"Bridge API token not readable ({e.strerror}); start the bridge once to create it")
+    if not token:
+        raise BridgeTokenError("Bridge API token is empty; delete it and restart the bridge")
+    return token
+
+
+def _bridge_post(path: str, payload: Dict[str, Any], timeout: Optional[float] = None) -> requests.Response:
+    """POST JSON to the bridge with its API token."""
+    return _bridge.post(f"{WHATSAPP_API_BASE_URL}{path}", json=payload, timeout=timeout,
+                        headers={"Authorization": f"Bearer {_bridge_token()}"})
 
 def _not_in(column: str, jids) -> Tuple[str, list]:
     """SQL clause and params excluding the given chat JIDs."""
@@ -884,8 +908,7 @@ def _send_mark_read(plan: Dict[str, List[str]]) -> Dict[str, Any]:
             results.append({"chat_jid": chat_jid, "success": False, "message": "Chat not found"})
             continue
         try:
-            response = _bridge.post(f"{WHATSAPP_API_BASE_URL}/mark-read",
-                                     json={"chat_jid": chat_jid, "message_ids": message_ids}, timeout=60)
+            response = _bridge_post("/mark-read", {"chat_jid": chat_jid, "message_ids": message_ids}, timeout=60)
             body = response.json()
             results.append({"chat_jid": chat_jid, "success": bool(body.get("success")),
                             "marked": body.get("marked", 0), "message": body.get("message", "")})
@@ -901,13 +924,13 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
         if not recipient:
             return False, "Recipient must be provided"
         
-        url = f"{WHATSAPP_API_BASE_URL}/send"
+        path = "/send"
         payload = {
             "recipient": recipient,
             "message": message,
         }
         
-        response = _bridge.post(url, json=payload)
+        response = _bridge_post(path, payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -935,13 +958,13 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
         
-        url = f"{WHATSAPP_API_BASE_URL}/send"
+        path = "/send"
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
         
-        response = _bridge.post(url, json=payload)
+        response = _bridge_post(path, payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -975,13 +998,13 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             except Exception as e:
                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
         
-        url = f"{WHATSAPP_API_BASE_URL}/send"
+        path = "/send"
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
         
-        response = _bridge.post(url, json=payload)
+        response = _bridge_post(path, payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -1016,13 +1039,13 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
         return None
 
     try:
-        url = f"{WHATSAPP_API_BASE_URL}/download"
+        path = "/download"
         payload = {
             "message_id": message_id,
             "chat_jid": chat_jid
         }
         
-        response = _bridge.post(url, json=payload)
+        response = _bridge_post(path, payload)
         
         if response.status_code == 200:
             result = response.json()

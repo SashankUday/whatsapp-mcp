@@ -228,6 +228,16 @@ There are two ways to clear messages, and they are very different:
 
 When you first run a bridge with read-state tracking, it backs up `store/messages.db` (to `store/messages.db.pre-read-state-<time>.bak`) before adding the new columns. Your WhatsApp session is untouched, so you don't need to pair again.
 
+## Bridge API security
+
+The bridge's REST API (port 8080) can send messages, so it is locked down:
+
+- It listens on `127.0.0.1` only, so other machines on your network can't reach it.
+- Every request must carry a shared secret. The bridge creates it on first start at `whatsapp-bridge/store/api-token` (readable only by you, and git-ignored with the rest of `store/`), and the MCP server reads it from there. To rotate it, delete the file and restart the bridge.
+- Requests from web pages are refused: anything with an `Origin` header, a Host other than `127.0.0.1:8080` or `localhost:8080`, or a POST body that isn't JSON is rejected.
+
+Run the tests with `go test ./...` in `whatsapp-bridge/` and `uv run python -m unittest discover -s tests` in `whatsapp-mcp-server/`.
+
 ## Technical Details
 
 1. Claude sends requests to the Python MCP server

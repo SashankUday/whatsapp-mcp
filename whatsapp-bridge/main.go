@@ -738,11 +738,13 @@ func listenAPI(port int) (net.Listener, error) {
 	return net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 }
 
-// requireLocal rejects requests whose Host header isn't this machine's API
-// address (DNS rebinding) and POSTs that aren't JSON. Browsers can send a
-// cross-site text/plain POST without asking, but must ask permission (CORS
-// preflight, which this API never grants) before sending application/json.
-func requireLocal(port int, next http.Handler) http.Handler {
+// requireLocal guards every endpoint. It rejects:
+//   - a Host header that isn't this machine's API address (DNS rebinding)
+//   - any Origin header: browsers send one on cross-site and same-site
+//     requests, the MCP server never does, so this blocks web pages outright
+//   - a missing or wrong API token (other programs on this machine)
+//   - POSTs that aren't JSON
+func requireLocal(port int, token string, next http.Handler) http.Handler {
 	allowed := map[string]bool{
 		fmt.Sprintf("127.0.0.1:%d", port): true,
 		fmt.Sprintf("localhost:%d", port): true,
@@ -750,6 +752,15 @@ func requireLocal(port int, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !allowed[r.Host] {
 			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		if _, ok := r.Header["Origin"]; ok {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		if !validAPIToken(r.Header.Get("Authorization"), token) {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 		if r.Method == http.MethodPost {
@@ -764,7 +775,7 @@ func requireLocal(port int, next http.Handler) http.Handler {
 }
 
 // newAPIHandler builds the REST API that exposes the WhatsApp client.
-func newAPIHandler(client *whatsmeow.Client, messageStore *MessageStore, port int) http.Handler {
+func newAPIHandler(client *whatsmeow.Client, messageStore *MessageStore, port int, token string) http.Handler {
 	mux := http.NewServeMux()
 
 	// Handler for sending messages
@@ -907,11 +918,11 @@ func newAPIHandler(client *whatsmeow.Client, messageStore *MessageStore, port in
 		respond(http.StatusOK, true, marked, fmt.Sprintf("Marked %d message(s) read on WhatsApp", marked))
 	})
 
-	return requireLocal(port, mux)
+	return requireLocal(port, token, mux)
 }
 
 // Start the REST API server on 127.0.0.1. Exits if the port can't be bound.
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, token string) {
 	listener, err := listenAPI(port)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "REST API server could not listen on 127.0.0.1:%d: %v\n", port, err)
@@ -922,7 +933,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.Serve(listener, newAPIHandler(client, messageStore, port)); err != nil {
+		if err := http.Serve(listener, newAPIHandler(client, messageStore, port, token)); err != nil {
 			fmt.Fprintf(os.Stderr, "REST API server error: %v\n", err)
 			os.Exit(1)
 		}
@@ -944,6 +955,13 @@ func main() {
 	if err := os.MkdirAll("store", 0755); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
+	}
+
+	// Shared secret required by every REST API request
+	apiToken, err := loadOrCreateAPIToken(apiTokenPath)
+	if err != nil {
+		logger.Errorf("%v", err)
+		os.Exit(1)
 	}
 
 	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
@@ -1066,7 +1084,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, apiPort)
+	startRESTServer(client, messageStore, apiPort, apiToken)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
