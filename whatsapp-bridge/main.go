@@ -92,6 +92,11 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	if err := migrateReadState(db, "store/messages.db"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to add read-state tracking: %v", err)
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -112,9 +117,11 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
-// Store a message in the database
+// Store a message in the database. live is true for messages received while
+// the bridge is running (unread until read), false for history sync.
+// Re-storing a message keeps its read state.
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64, live bool) error {
 	if IsBlocked(chatJID) {
 		return nil
 	}
@@ -124,11 +131,19 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		return nil
 	}
 
+	readState, readSource, readAt := store.initialReadState(id, chatJID, timestamp, isFromMe, live)
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length,
+		 read_state, read_source, read_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id, chat_jid) DO UPDATE SET
+			sender = excluded.sender, content = excluded.content, timestamp = excluded.timestamp,
+			is_from_me = excluded.is_from_me, media_type = excluded.media_type, filename = excluded.filename,
+			url = excluded.url, media_key = excluded.media_key, file_sha256 = excluded.file_sha256,
+			file_enc_sha256 = excluded.file_enc_sha256, file_length = excluded.file_length`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		readState, sql.NullString{String: readSource, Valid: readSource != ""}, readAt,
 	)
 	return err
 }
@@ -464,6 +479,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		true,
 	)
 
 	if err != nil {
@@ -483,6 +499,19 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 	}
+}
+
+// MarkReadRequest is the request body for the mark-read API
+type MarkReadRequest struct {
+	ChatJID    string   `json:"chat_jid"`
+	MessageIDs []string `json:"message_ids"`
+}
+
+// MarkReadResponse is the response for the mark-read API
+type MarkReadResponse struct {
+	Success bool   `json:"success"`
+	Marked  int    `json:"marked"`
+	Message string `json:"message"`
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -797,6 +826,49 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for marking messages read on WhatsApp (sends read receipts; senders
+	// may see blue ticks). The MCP server only calls this after a confirmed dry run.
+	http.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req MarkReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		respond := func(status int, success bool, marked int, message string) {
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(MarkReadResponse{Success: success, Marked: marked, Message: message})
+		}
+		chat, err := types.ParseJID(req.ChatJID)
+		if err != nil || req.ChatJID == "" || len(req.MessageIDs) == 0 {
+			respond(http.StatusBadRequest, false, 0, "chat_jid and message_ids are required")
+			return
+		}
+		if chatBlocked(client, chat) {
+			respond(http.StatusNotFound, false, 0, "Chat not found")
+			return
+		}
+		batches, err := planMarkRead(client, messageStore, chat, req.MessageIDs)
+		if err != nil {
+			respond(http.StatusInternalServerError, false, 0, err.Error())
+			return
+		}
+		if len(batches) == 0 {
+			respond(http.StatusNotFound, false, 0, "No matching incoming messages in that chat")
+			return
+		}
+		marked, err := markReadOnWhatsApp(client, messageStore, batches)
+		if err != nil {
+			respond(http.StatusInternalServerError, false, marked, err.Error())
+			return
+		}
+		respond(http.StatusOK, true, marked, fmt.Sprintf("Marked %d message(s) read on WhatsApp", marked))
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -870,6 +942,14 @@ func main() {
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
+
+		case *events.Receipt:
+			// Messages you read on another device
+			handleReceipt(client, messageStore, v, logger)
+
+		case *events.MarkChatAsRead:
+			// A chat marked read or unread on another device
+			handleMarkChatAsRead(client, messageStore, v, logger)
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
@@ -1234,6 +1314,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					false,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
@@ -1248,6 +1329,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
 					}
 				}
+			}
+
+			// Approximate read state from the conversation's unread count
+			if err := messageStore.applyHistoryUnreadCount(chatJID, conversation.GetUnreadCount(), conversation.GetMarkedAsUnread()); err != nil {
+				logger.Warnf("Failed to apply unread count for %s: %v", chatJID, err)
 			}
 		}
 	}
