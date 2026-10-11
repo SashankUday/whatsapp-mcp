@@ -6,3 +6,6 @@ blocklist.txt
 
 # Bridge data: WhatsApp session keys, message database, downloaded media
 whatsapp-bridge/store/
+
+# Binary from `go build .` in whatsapp-bridge/
+whatsapp-bridge/whatsapp-client
