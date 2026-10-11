@@ -165,26 +165,78 @@ By default, just the metadata of the media is stored in the local database. The 
 
 You can keep personal chats out of reach of the MCP server with a blocklist. Copy `blocklist.example.txt` to `blocklist.txt` in the repo root and list the chats to hide. `blocklist.txt` is git-ignored so your entries are never committed. To keep the file somewhere else, set `WHATSAPP_MCP_BLOCKLIST` to its path for both the bridge and the MCP server.
 
+Blocking is per chat and by ID only:
+
 ```
 # One entry per line; '#' starts a comment
-+44 7700 900000                  # phone number (spaces, +, -, brackets ignored)
-120363000000000000@g.us          # exact JID, individual or group
-name: Example Family Group       # chat name, case-insensitive exact match
-Example Friend                   # bare text is also a chat name
++44 7700 900000                  # phone number: blocks your 1:1 chat with that person
+105506358227070@lid              # LID: also blocks that person's 1:1 chat
+447700900000@s.whatsapp.net      # phone JID: the same
+120363000000000000@g.us          # group JID: blocks that group
 ```
+
+- A person's phone number and their linked identity (LID) are the same chat. WhatsApp keys some 1:1 chats by LID, so an entry in either form blocks the chat however it is stored (the bridge's `whatsmeow_lid_map` links the two). Listing both is safest.
+- Blocking a person does not hide their messages in group chats you haven't blocked. There they stay visible, with their name.
+- To find a group's ID, stop the bridge and run `cd whatsapp-bridge && go run . -list-groups`. It prints the ID and name of every group you're in, then exits. It can't run alongside the bridge, because both would use the same WhatsApp session.
+- Display names are not matched: names change and aren't unique. Any line that isn't a number or a JID (a name, or a mistyped number) makes the whole file invalid, and then everything is blocked until it is fixed, so a bad line can never quietly unblock a chat.
 
 What blocking does:
 
-- **Go bridge**: messages and chat metadata from blocked chats are not stored in `messages.db` or printed to the console, and media downloads from them are refused.
+- **Go bridge**: messages and chat metadata from blocked chats are dropped before they are stored in `messages.db` or printed to the console, and media downloads from them are refused.
 - **MCP server**: every read tool (`list_messages`, `list_chats`, `search_contacts`, `get_chat`, `get_contact_chats`, `get_last_interaction`, `get_direct_chat_by_contact`, `get_message_context`, `download_media`) excludes blocked chats. A blocked message looks the same as a missing one. Send tools are unchanged.
 
-The file is re-read when it changes, so edits apply without a restart. If the file is missing, nothing is blocked. If it exists but can't be read, the read tools return an error instead of unfiltered data, and the bridge stores nothing until it is readable again.
+The file is re-read when it changes, so edits apply without a restart. If the file is missing, nothing is blocked. If it exists but can't be read or parsed, the read tools return an error instead of unfiltered data, and the bridge stores nothing until it is fixed.
 
-Notes:
+Messages stored before a chat was blocked stay in `whatsapp-bridge/store/messages.db`. The MCP server still hides them, but delete them from the database if you don't want them on disk.
 
-- A phone number matches the chat with that number (the user part of the chat JID). It does not hide that person's messages inside group chats; block the group itself if needed.
-- Some chats use privacy IDs (`...@lid`) instead of phone numbers. Block those by JID or by chat name.
-- Messages stored before a chat was blocked stay in `whatsapp-bridge/store/messages.db`. The MCP server still hides them, but delete them from the database if you don't want them on disk.
+## Sender names
+
+WhatsApp now identifies group participants by LID (for example `105506358227070@lid`) rather than phone number. The MCP server turns these into names using the bridge's whatsmeow store, `whatsapp-bridge/store/whatsapp.db`, which it opens read-only:
+
+1. A LID is mapped to the person's phone number (`whatsmeow_lid_map`).
+2. The name is the first one found, for either the LID or the phone number, in this order: your address-book name, first name, the name they set themselves (push name), then business name (`whatsmeow_contacts`).
+3. If none is found, the name of a 1:1 chat with that person is used, and failing that the raw ID.
+
+Your own messages still show as "Me". Messages returned by `get_message_context` and the chat tools include a `sender_name` or `last_sender_name` field, and 1:1 chats that were only named by number show the contact's name. `search_contacts` also finds people you only share groups with, and returns both their phone JID and LID. The `sender_phone_number` filter in `list_messages` accepts a phone number, phone JID or LID.
+
+Restart the MCP server (for Claude Desktop, quit and reopen it) to pick up these changes. Restart the bridge too: it then gives LID-keyed 1:1 chats real names when it stores them, and applies the LID/phone-aware blocking above before storing anything. Restarting the bridge does not require pairing again.
+
+## Read state
+
+The bridge tracks which messages you have read, so "unread" in the MCP tools matches what your phone shows. Each stored message is `read`, `unread` or `unknown`:
+
+- Messages you send are read. Messages received while the bridge is running start unread.
+- When you read messages on your phone or another device, WhatsApp sends your linked devices a read receipt (`read`, or `read-self` if your read receipts are off). The bridge marks those messages read.
+- Marking a whole chat as read on another device marks everything up to that moment read. Marking a chat as unread sets a `marked_unread` flag on the chat; it doesn't change individual messages.
+- A history sync (when the bridge is first linked) carries an unread count per chat. The newest that many incoming messages are marked unread and older ones read. This is an approximation, since the count can include messages the bridge doesn't store, such as reactions.
+
+Limits:
+
+- Read state is only tracked while the bridge is running and connected. Receipts that arrive while it is stopped are usually delivered when it reconnects, but this isn't guaranteed.
+- Messages stored before this feature was added are `unknown`, because the bridge never recorded their read state, and they are left out of unread listings. They become read if you mark their chat read on your phone.
+- Blocked chats are skipped entirely: no read state, unread count or activity is recorded or shown for them.
+
+Tools:
+
+- `list_messages` tags each message `[read]`, `[unread]` or `[unknown]`, and has an `unread_only` option. `list_chats` and `get_chat` include `unread_count` and `marked_unread`.
+- `list_unread_messages` returns unread messages across chats, grouped by chat, oldest first.
+
+There are two ways to clear messages, and they are very different:
+
+- **`dismiss_messages`** (local only): sets a "dismissed" flag in `messages.db`, so messages drop out of unread listings. Nothing is sent to WhatsApp, the messages stay unread on your phone, and nobody is notified. Undo with `undo=true`. Use this for triage.
+- **`mark_read_on_whatsapp`** (sends read receipts): marks messages read on WhatsApp itself, so your phone and other devices show them as read. If your read receipts are on, senders may see blue ticks. It works in two steps: the first call is a dry run that reports how many messages per chat would be marked and returns a token that expires after five minutes. Only a second call with that token sends anything. It refuses blocked chats and handles one chat per call unless you list several and set `confirm_multiple_chats`.
+
+When you first run a bridge with read-state tracking, it backs up `store/messages.db` (to `store/messages.db.pre-read-state-<time>.bak`) before adding the new columns. Your WhatsApp session is untouched, so you don't need to pair again.
+
+## Bridge API security
+
+The bridge's REST API (port 8080) can send messages, so it is locked down:
+
+- It listens on `127.0.0.1` only, so other machines on your network can't reach it.
+- Every request must carry a shared secret. The bridge creates it on first start at `whatsapp-bridge/store/api-token` (readable only by you, and git-ignored with the rest of `store/`), and the MCP server reads it from there. To rotate it, delete the file and restart the bridge.
+- Requests from web pages are refused: anything with an `Origin` header, a Host other than `127.0.0.1:8080` or `localhost:8080`, or a POST body that isn't JSON is rejected.
+
+Run the tests with `go test ./...` in `whatsapp-bridge/` and `uv run python -m unittest discover -s tests` in `whatsapp-mcp-server/`.
 
 ## Technical Details
 

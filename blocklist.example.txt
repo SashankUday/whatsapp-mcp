@@ -4,16 +4,19 @@
 # that must never be read through the MCP server. Set WHATSAPP_MCP_BLOCKLIST
 # to use a different path. Edits apply without restarting anything.
 #
-# One entry per line; '#' starts a comment. All entries below are fake.
+# Blocking is per chat and by ID only. One entry per line; '#' starts a
+# comment. Display names are not supported: any line that isn't a number or a
+# JID makes the file invalid, and then everything is blocked until it's fixed.
+# All entries below are fake.
 
-# Phone number: spaces, '+', '-' and brackets are ignored
+# A person's 1:1 chat, by phone number (spaces, '+', '-' and brackets ignored).
+# Their messages in group chats you haven't blocked stay visible.
 +1 (555) 010-0199
-44 7700 900000
 
-# Exact JID: an individual chat or a group
+# The same person by LID: phone number and LID are the same chat, so listing
+# both is safest
+100000000000001@lid
+
+# Exact JIDs: an individual chat or a group
 15550100198@s.whatsapp.net
 120363000000000000@g.us
-
-# Chat name, case-insensitive exact match ("name:" prefix or bare text)
-name: Example Family Group
-Example Friend

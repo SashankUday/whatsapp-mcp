@@ -5,14 +5,18 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"math"
 	"math/rand"
+	"mime"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -24,6 +28,8 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
+	waStore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -90,6 +96,11 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	if err := migrateReadState(db, "store/messages.db"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to add read-state tracking: %v", err)
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -100,7 +111,7 @@ func (store *MessageStore) Close() error {
 
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
-	if IsBlocked(jid, name) {
+	if IsBlocked(jid) {
 		return nil
 	}
 	_, err := store.db.Exec(
@@ -110,10 +121,12 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
-// Store a message in the database
+// Store a message in the database. live is true for messages received while
+// the bridge is running (unread until read), false for history sync.
+// Re-storing a message keeps its read state.
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
-	if IsBlocked(chatJID, "") {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64, live bool) error {
+	if IsBlocked(chatJID) {
 		return nil
 	}
 
@@ -122,11 +135,19 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		return nil
 	}
 
+	readState, readSource, readAt := store.initialReadState(id, chatJID, timestamp, isFromMe, live)
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length,
+		 read_state, read_source, read_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id, chat_jid) DO UPDATE SET
+			sender = excluded.sender, content = excluded.content, timestamp = excluded.timestamp,
+			is_from_me = excluded.is_from_me, media_type = excluded.media_type, filename = excluded.filename,
+			url = excluded.url, media_key = excluded.media_key, file_sha256 = excluded.file_sha256,
+			file_enc_sha256 = excluded.file_enc_sha256, file_length = excluded.file_length`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		readState, sql.NullString{String: readSource, Valid: readSource != ""}, readAt,
 	)
 	return err
 }
@@ -421,18 +442,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
 
-	// Skip blocked chats before name lookup, which logs the chat
-	if IsBlocked(chatJID, "") {
+	// Skip blocked chats entirely, before the name lookup (which logs the
+	// chat): nothing is stored or printed
+	if chatBlockedWithAliases(client, msg.Info.Chat, messageChatAliases(msg.Info.MessageSource)...) {
 		return
 	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
-
-	// Skip blocked chats entirely: nothing is stored or printed
-	if IsBlocked(chatJID, name) {
-		return
-	}
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -466,6 +483,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		true,
 	)
 
 	if err != nil {
@@ -485,6 +503,19 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 	}
+}
+
+// MarkReadRequest is the request body for the mark-read API
+type MarkReadRequest struct {
+	ChatJID    string   `json:"chat_jid"`
+	MessageIDs []string `json:"message_ids"`
+}
+
+// MarkReadResponse is the response for the mark-read API
+type MarkReadResponse struct {
+	Success bool   `json:"success"`
+	Marked  int    `json:"marked"`
+	Message string `json:"message"`
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -579,9 +610,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// Refuse to download media from blocked chats
-	var chatName string
-	messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&chatName)
-	if IsBlocked(chatJID, chatName) {
+	if IsBlocked(chatJID) {
+		return false, "", "", "", fmt.Errorf("chat is blocked")
+	}
+	if jid, err := types.ParseJID(chatJID); err == nil && chatBlocked(client, jid) {
 		return false, "", "", "", fmt.Errorf("chat is blocked")
 	}
 
@@ -699,10 +731,57 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+// apiPort is the REST API port. The API only ever listens on 127.0.0.1.
+const apiPort = 8080
+
+// listenAPI binds the REST API to the loopback interface only, so nothing
+// outside this machine can reach it.
+func listenAPI(port int) (net.Listener, error) {
+	return net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+}
+
+// requireLocal guards every endpoint. It rejects:
+//   - a Host header that isn't this machine's API address (DNS rebinding)
+//   - any Origin header: browsers send one on cross-site and same-site
+//     requests, the MCP server never does, so this blocks web pages outright
+//   - a missing or wrong API token (other programs on this machine)
+//   - POSTs that aren't JSON
+func requireLocal(port int, token string, next http.Handler) http.Handler {
+	allowed := map[string]bool{
+		fmt.Sprintf("127.0.0.1:%d", port): true,
+		fmt.Sprintf("localhost:%d", port): true,
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !allowed[r.Host] {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		if _, ok := r.Header["Origin"]; ok {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		if !validAPIToken(r.Header.Get("Authorization"), token) {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodPost {
+			mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if err != nil || mediaType != "application/json" {
+				http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// newAPIHandler builds the REST API that exposes the WhatsApp client.
+func newAPIHandler(client *whatsmeow.Client, messageStore *MessageStore, port int, token string) http.Handler {
+	mux := http.NewServeMux()
+
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -748,7 +827,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -798,19 +877,78 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	// Handler for marking messages read on WhatsApp (sends read receipts; senders
+	// may see blue ticks). The MCP server only calls this after a confirmed dry run.
+	mux.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req MarkReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		respond := func(status int, success bool, marked int, message string) {
+			w.WriteHeader(status)
+			json.NewEncoder(w).Encode(MarkReadResponse{Success: success, Marked: marked, Message: message})
+		}
+		chat, err := types.ParseJID(req.ChatJID)
+		if err != nil || req.ChatJID == "" || len(req.MessageIDs) == 0 {
+			respond(http.StatusBadRequest, false, 0, "chat_jid and message_ids are required")
+			return
+		}
+		if chatBlocked(client, chat) {
+			respond(http.StatusNotFound, false, 0, "Chat not found")
+			return
+		}
+		batches, err := planMarkRead(client, messageStore, chat, req.MessageIDs)
+		if err != nil {
+			respond(http.StatusInternalServerError, false, 0, err.Error())
+			return
+		}
+		if len(batches) == 0 {
+			respond(http.StatusNotFound, false, 0, "No matching incoming messages in that chat")
+			return
+		}
+		marked, err := markReadOnWhatsApp(client, messageStore, batches)
+		if err != nil {
+			respond(http.StatusInternalServerError, false, marked, err.Error())
+			return
+		}
+		respond(http.StatusOK, true, marked, fmt.Sprintf("Marked %d message(s) read on WhatsApp", marked))
+	})
+
+	return requireLocal(port, token, mux)
+}
+
+// Start the REST API server on 127.0.0.1. Exits if the port can't be bound.
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, token string) {
+	listener, err := listenAPI(port)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "REST API server could not listen on 127.0.0.1:%d: %v\n", port, err)
+		client.Disconnect()
+		os.Exit(1)
+	}
+	fmt.Printf("Starting REST API server on %s (this machine only)...\n", listener.Addr())
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
-			fmt.Printf("REST API server error: %v\n", err)
+		if err := http.Serve(listener, newAPIHandler(client, messageStore, port, token)); err != nil {
+			fmt.Fprintf(os.Stderr, "REST API server error: %v\n", err)
+			os.Exit(1)
 		}
 	}()
 }
 
 func main() {
+	listGroups := flag.Bool("list-groups", false, "print the ID and name of every joined group, then exit (use it to find group IDs for blocklist.txt)")
+	flag.Parse()
+
+	// Name shown for this device in the phone's Linked devices list (set at pairing)
+	waStore.DeviceProps.Os = proto.String("WhatsApp MCP")
+
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
@@ -822,6 +960,13 @@ func main() {
 	if err := os.MkdirAll("store", 0755); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
+	}
+
+	// Shared secret required by every REST API request
+	apiToken, err := loadOrCreateAPIToken(apiTokenPath)
+	if err != nil {
+		logger.Errorf("%v", err)
+		os.Exit(1)
 	}
 
 	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
@@ -868,6 +1013,14 @@ func main() {
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
+
+		case *events.Receipt:
+			// Messages you read on another device
+			handleReceipt(client, messageStore, v, logger)
+
+		case *events.MarkChatAsRead:
+			// A chat marked read or unread on another device
+			handleMarkChatAsRead(client, messageStore, v, logger)
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
@@ -927,10 +1080,16 @@ func main() {
 		return
 	}
 
+	if *listGroups {
+		printJoinedGroups(client, logger)
+		client.Disconnect()
+		return
+	}
+
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, apiPort, apiToken)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -946,12 +1105,154 @@ func main() {
 	client.Disconnect()
 }
 
+// contactJIDs returns a 1:1 chat's JID plus its LID or phone-number alias, if known.
+func contactJIDs(client *whatsmeow.Client, jid types.JID) []types.JID {
+	jids := []types.JID{jid}
+	if client == nil || client.Store == nil {
+		return jids
+	}
+	if alt, err := client.Store.GetAltJID(context.Background(), jid); err == nil && !alt.IsEmpty() {
+		jids = append(jids, alt)
+	}
+	return jids
+}
+
+// contactNames returns a person's known names across their LID and phone-number
+// JIDs, best first: address-book full name, first name, push name, business name.
+func contactNames(client *whatsmeow.Client, jid types.JID) []string {
+	if client == nil || client.Store == nil || client.Store.Contacts == nil ||
+		(jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer) {
+		return nil
+	}
+	var contacts []types.ContactInfo
+	for _, j := range contactJIDs(client, jid) {
+		if contact, err := client.Store.Contacts.GetContact(context.Background(), j); err == nil && contact.Found {
+			contacts = append(contacts, contact)
+		}
+	}
+	var names []string
+	for _, field := range []func(types.ContactInfo) string{
+		func(c types.ContactInfo) string { return c.FullName },
+		func(c types.ContactInfo) string { return c.FirstName },
+		func(c types.ContactInfo) string { return c.PushName },
+		func(c types.ContactInfo) string { return c.BusinessName },
+	} {
+		for _, contact := range contacts {
+			if n := field(contact); n != "" {
+				names = append(names, n)
+			}
+		}
+	}
+	return names
+}
+
+// chatBlocked checks a chat against the blocklist by its JID and, for 1:1
+// chats, by its LID/phone-number alias, so an entry for either form blocks the
+// chat. Display names are never used.
+func chatBlocked(client *whatsmeow.Client, jid types.JID) bool {
+	if IsBlocked(jid.String()) {
+		return true
+	}
+	if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
+		return false
+	}
+	for _, j := range contactJIDs(client, jid)[1:] {
+		if IsBlocked(j.String()) {
+			return true
+		}
+	}
+	return false
+}
+
+// chatBlockedWithAliases is chatBlocked plus any alias the event itself
+// carries for a 1:1 chat (a live message's sender/recipient alt, a history sync
+// conversation's phone/LID JID). Blocking then doesn't depend on whatsmeow
+// having stored the LID mapping yet: on a fresh pairing it stores history-sync
+// mappings in the background, possibly after the event reaches us.
+func chatBlockedWithAliases(client *whatsmeow.Client, jid types.JID, aliases ...types.JID) bool {
+	if chatBlocked(client, jid) {
+		return true
+	}
+	jid = normalizeUserJID(jid)
+	if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
+		return false
+	}
+	for _, alias := range append([]types.JID{jid}, aliases...) {
+		alias = normalizeUserJID(alias)
+		if alias.IsEmpty() || (alias.Server != types.DefaultUserServer && alias.Server != types.HiddenUserServer) {
+			continue
+		}
+		if chatBlocked(client, alias) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeUserJID drops any device part and maps the legacy c.us server to
+// s.whatsapp.net, as whatsmeow does when it stores history-sync mappings.
+func normalizeUserJID(jid types.JID) types.JID {
+	jid = jid.ToNonAD()
+	if jid.Server == types.LegacyUserServer {
+		jid.Server = types.DefaultUserServer
+	}
+	return jid
+}
+
+// messageChatAliases returns the alternative address of a 1:1 chat carried
+// by a message or receipt: the sender's alt for incoming, the recipient's for
+// outgoing.
+func messageChatAliases(src types.MessageSource) []types.JID {
+	if src.IsGroup {
+		return nil
+	}
+	return []types.JID{src.SenderAlt, src.RecipientAlt}
+}
+
+// historyChatAliases returns the phone/LID aliases a history sync carries for
+// a conversation: its own PN/LID JID fields and the sync's mapping list.
+func historyChatAliases(jid types.JID, conversation *waHistorySync.Conversation, pnToLID map[string]string) []types.JID {
+	var aliases []types.JID
+	for _, s := range []string{conversation.GetPnJID(), conversation.GetLidJID()} {
+		if alias, err := types.ParseJID(s); err == nil && s != "" {
+			aliases = append(aliases, alias)
+		}
+	}
+	key := normalizeUserJID(jid).String()
+	if lid, ok := pnToLID[key]; ok {
+		if alias, err := types.ParseJID(lid); err == nil {
+			aliases = append(aliases, alias)
+		}
+	}
+	for pn, lid := range pnToLID {
+		if lid == key {
+			if alias, err := types.ParseJID(pn); err == nil {
+				aliases = append(aliases, alias)
+			}
+		}
+	}
+	return aliases
+}
+
+// printJoinedGroups prints "<group JID>\t<name>" for every joined group, sorted by name.
+func printJoinedGroups(client *whatsmeow.Client, logger waLog.Logger) {
+	groups, err := client.GetJoinedGroups(context.Background())
+	if err != nil {
+		logger.Errorf("Failed to get joined groups: %v", err)
+		return
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i].Name < groups[j].Name })
+	for _, group := range groups {
+		fmt.Printf("%s\t%s\n", group.JID, group.Name)
+	}
+}
+
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
+	if err == nil && existingName != "" && existingName != jid.User {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -1011,10 +1312,9 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
+		// Use contact info, looking at both the LID and phone-number JIDs
+		if names := contactNames(client, jid); len(names) > 0 {
+			name = names[0]
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender
@@ -1033,6 +1333,16 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
 
+	// Phone number <-> LID pairs carried by this sync, for the blocklist check
+	pnToLID := map[string]string{}
+	for _, m := range historySync.Data.GetPhoneNumberToLidMappings() {
+		pn, errPN := types.ParseJID(m.GetPnJID())
+		lid, errLID := types.ParseJID(m.GetLidJID())
+		if errPN == nil && errLID == nil && !pn.IsEmpty() && !lid.IsEmpty() {
+			pnToLID[normalizeUserJID(pn).String()] = normalizeUserJID(lid).String()
+		}
+	}
+
 	syncedCount := 0
 	for _, conversation := range historySync.Data.Conversations {
 		// Parse JID from the conversation
@@ -1049,18 +1359,14 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
-		// Skip blocked chats before name lookup, which logs the chat
-		if IsBlocked(chatJID, "") {
+		// Skip blocked chats entirely, before the name lookup (which logs the
+		// chat) and before any write: chat row, messages or read state
+		if chatBlockedWithAliases(client, jid, historyChatAliases(jid, conversation, pnToLID)...) {
 			continue
 		}
 
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
-
-		// Skip blocked chats entirely
-		if IsBlocked(chatJID, name) {
-			continue
-		}
 
 		// Process messages
 		messages := conversation.Messages
@@ -1160,6 +1466,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					false,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
@@ -1174,6 +1481,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
 					}
 				}
+			}
+
+			// Approximate read state from the conversation's unread count
+			if err := messageStore.applyHistoryUnreadCount(chatJID, conversation.GetUnreadCount(), conversation.GetMarkedAsUnread()); err != nil {
+				logger.Warnf("Failed to apply unread count for %s: %v", chatJID, err)
 			}
 		}
 	}
