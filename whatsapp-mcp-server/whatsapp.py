@@ -13,7 +13,10 @@ from blocklist import is_blocked, blocked_jids
 from names import NameResolver, split_jid, normalise_number
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+# The bridge only listens on 127.0.0.1. Never route its calls through a proxy.
+WHATSAPP_API_BASE_URL = "http://127.0.0.1:8080/api"
+_bridge = requests.Session()
+_bridge.trust_env = False
 
 def _not_in(column: str, jids) -> Tuple[str, list]:
     """SQL clause and params excluding the given chat JIDs."""
@@ -881,7 +884,7 @@ def _send_mark_read(plan: Dict[str, List[str]]) -> Dict[str, Any]:
             results.append({"chat_jid": chat_jid, "success": False, "message": "Chat not found"})
             continue
         try:
-            response = requests.post(f"{WHATSAPP_API_BASE_URL}/mark-read",
+            response = _bridge.post(f"{WHATSAPP_API_BASE_URL}/mark-read",
                                      json={"chat_jid": chat_jid, "message_ids": message_ids}, timeout=60)
             body = response.json()
             results.append({"chat_jid": chat_jid, "success": bool(body.get("success")),
@@ -904,7 +907,7 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
             "message": message,
         }
         
-        response = requests.post(url, json=payload)
+        response = _bridge.post(url, json=payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -938,7 +941,7 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = _bridge.post(url, json=payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -978,7 +981,7 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = _bridge.post(url, json=payload)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -1019,7 +1022,7 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload)
+        response = _bridge.post(url, json=payload)
         
         if response.status_code == 200:
             result = response.json()

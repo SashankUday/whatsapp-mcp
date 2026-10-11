@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"mime"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -727,10 +729,46 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+// apiPort is the REST API port. The API only ever listens on 127.0.0.1.
+const apiPort = 8080
+
+// listenAPI binds the REST API to the loopback interface only, so nothing
+// outside this machine can reach it.
+func listenAPI(port int) (net.Listener, error) {
+	return net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+}
+
+// requireLocal rejects requests whose Host header isn't this machine's API
+// address (DNS rebinding) and POSTs that aren't JSON. Browsers can send a
+// cross-site text/plain POST without asking, but must ask permission (CORS
+// preflight, which this API never grants) before sending application/json.
+func requireLocal(port int, next http.Handler) http.Handler {
+	allowed := map[string]bool{
+		fmt.Sprintf("127.0.0.1:%d", port): true,
+		fmt.Sprintf("localhost:%d", port): true,
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !allowed[r.Host] {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		if r.Method == http.MethodPost {
+			mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if err != nil || mediaType != "application/json" {
+				http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// newAPIHandler builds the REST API that exposes the WhatsApp client.
+func newAPIHandler(client *whatsmeow.Client, messageStore *MessageStore, port int) http.Handler {
+	mux := http.NewServeMux()
+
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -776,7 +814,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -828,7 +866,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for marking messages read on WhatsApp (sends read receipts; senders
 	// may see blue ticks). The MCP server only calls this after a confirmed dry run.
-	http.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/mark-read", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -869,14 +907,24 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		respond(http.StatusOK, true, marked, fmt.Sprintf("Marked %d message(s) read on WhatsApp", marked))
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	return requireLocal(port, mux)
+}
+
+// Start the REST API server on 127.0.0.1. Exits if the port can't be bound.
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	listener, err := listenAPI(port)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "REST API server could not listen on 127.0.0.1:%d: %v\n", port, err)
+		client.Disconnect()
+		os.Exit(1)
+	}
+	fmt.Printf("Starting REST API server on %s (this machine only)...\n", listener.Addr())
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
-			fmt.Printf("REST API server error: %v\n", err)
+		if err := http.Serve(listener, newAPIHandler(client, messageStore, port)); err != nil {
+			fmt.Fprintf(os.Stderr, "REST API server error: %v\n", err)
+			os.Exit(1)
 		}
 	}()
 }
@@ -1018,7 +1066,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, apiPort)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
