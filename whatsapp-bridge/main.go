@@ -100,7 +100,7 @@ func (store *MessageStore) Close() error {
 
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
-	if IsBlocked(jid, name) {
+	if IsBlocked(jid) {
 		return nil
 	}
 	_, err := store.db.Exec(
@@ -113,7 +113,7 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
-	if IsBlocked(chatJID, "") {
+	if IsBlocked(chatJID) {
 		return nil
 	}
 
@@ -421,18 +421,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
 
-	// Skip blocked chats before name lookup, which logs the chat
-	if IsBlocked(chatJID, "") {
+	// Skip blocked chats entirely, before the name lookup (which logs the
+	// chat): nothing is stored or printed
+	if chatBlocked(client, msg.Info.Chat) {
 		return
 	}
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
-
-	// Skip blocked chats entirely: nothing is stored or printed
-	if IsBlocked(chatJID, name) {
-		return
-	}
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -579,9 +575,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// Refuse to download media from blocked chats
-	var chatName string
-	messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&chatName)
-	if IsBlocked(chatJID, chatName) {
+	if IsBlocked(chatJID) {
+		return false, "", "", "", fmt.Errorf("chat is blocked")
+	}
+	if jid, err := types.ParseJID(chatJID); err == nil && chatBlocked(client, jid) {
 		return false, "", "", "", fmt.Errorf("chat is blocked")
 	}
 
@@ -946,12 +943,71 @@ func main() {
 	client.Disconnect()
 }
 
+// contactJIDs returns a 1:1 chat's JID plus its LID or phone-number alias, if known.
+func contactJIDs(client *whatsmeow.Client, jid types.JID) []types.JID {
+	jids := []types.JID{jid}
+	if client == nil || client.Store == nil {
+		return jids
+	}
+	if alt, err := client.Store.GetAltJID(context.Background(), jid); err == nil && !alt.IsEmpty() {
+		jids = append(jids, alt)
+	}
+	return jids
+}
+
+// contactNames returns a person's known names across their LID and phone-number
+// JIDs, best first: address-book full name, first name, push name, business name.
+func contactNames(client *whatsmeow.Client, jid types.JID) []string {
+	if client == nil || client.Store == nil || client.Store.Contacts == nil ||
+		(jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer) {
+		return nil
+	}
+	var contacts []types.ContactInfo
+	for _, j := range contactJIDs(client, jid) {
+		if contact, err := client.Store.Contacts.GetContact(context.Background(), j); err == nil && contact.Found {
+			contacts = append(contacts, contact)
+		}
+	}
+	var names []string
+	for _, field := range []func(types.ContactInfo) string{
+		func(c types.ContactInfo) string { return c.FullName },
+		func(c types.ContactInfo) string { return c.FirstName },
+		func(c types.ContactInfo) string { return c.PushName },
+		func(c types.ContactInfo) string { return c.BusinessName },
+	} {
+		for _, contact := range contacts {
+			if n := field(contact); n != "" {
+				names = append(names, n)
+			}
+		}
+	}
+	return names
+}
+
+// chatBlocked checks a chat against the blocklist by its JID and, for 1:1
+// chats, by its LID/phone-number alias, so an entry for either form blocks the
+// chat. Display names are never used.
+func chatBlocked(client *whatsmeow.Client, jid types.JID) bool {
+	if IsBlocked(jid.String()) {
+		return true
+	}
+	if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
+		return false
+	}
+	for _, j := range contactJIDs(client, jid)[1:] {
+		if IsBlocked(j.String()) {
+			return true
+		}
+	}
+	return false
+}
+
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
 	// First, check if chat already exists in database with a name
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
+	if err == nil && existingName != "" && existingName != jid.User {
 		// Chat exists with a name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
@@ -1011,10 +1067,9 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
+		// Use contact info, looking at both the LID and phone-number JIDs
+		if names := contactNames(client, jid); len(names) > 0 {
+			name = names[0]
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender
@@ -1049,18 +1104,13 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
-		// Skip blocked chats before name lookup, which logs the chat
-		if IsBlocked(chatJID, "") {
+		// Skip blocked chats entirely, before the name lookup (which logs the chat)
+		if chatBlocked(client, jid) {
 			continue
 		}
 
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
-
-		// Skip blocked chats entirely
-		if IsBlocked(chatJID, name) {
-			continue
-		}
 
 		// Process messages
 		messages := conversation.Messages

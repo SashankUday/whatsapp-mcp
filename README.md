@@ -165,26 +165,40 @@ By default, just the metadata of the media is stored in the local database. The 
 
 You can keep personal chats out of reach of the MCP server with a blocklist. Copy `blocklist.example.txt` to `blocklist.txt` in the repo root and list the chats to hide. `blocklist.txt` is git-ignored so your entries are never committed. To keep the file somewhere else, set `WHATSAPP_MCP_BLOCKLIST` to its path for both the bridge and the MCP server.
 
+Blocking is per chat and by ID only:
+
 ```
 # One entry per line; '#' starts a comment
-+44 7700 900000                  # phone number (spaces, +, -, brackets ignored)
-120363000000000000@g.us          # exact JID, individual or group
-name: Example Family Group       # chat name, case-insensitive exact match
-Example Friend                   # bare text is also a chat name
++44 7700 900000                  # phone number: blocks your 1:1 chat with that person
+105506358227070@lid              # LID: also blocks that person's 1:1 chat
+447700900000@s.whatsapp.net      # phone JID: the same
+120363000000000000@g.us          # group JID: blocks that group
 ```
+
+- A person's phone number and their linked identity (LID) are the same chat. WhatsApp keys some 1:1 chats by LID, so an entry in either form blocks the chat however it is stored (the bridge's `whatsmeow_lid_map` links the two). Listing both is safest.
+- Blocking a person does not hide their messages in group chats you haven't blocked. There they stay visible, with their name.
+- Display names are not matched: names change and aren't unique. Any line that isn't a number or a JID (a name, or a mistyped number) makes the whole file invalid, and then everything is blocked until it is fixed, so a bad line can never quietly unblock a chat.
 
 What blocking does:
 
-- **Go bridge**: messages and chat metadata from blocked chats are not stored in `messages.db` or printed to the console, and media downloads from them are refused.
+- **Go bridge**: messages and chat metadata from blocked chats are dropped before they are stored in `messages.db` or printed to the console, and media downloads from them are refused.
 - **MCP server**: every read tool (`list_messages`, `list_chats`, `search_contacts`, `get_chat`, `get_contact_chats`, `get_last_interaction`, `get_direct_chat_by_contact`, `get_message_context`, `download_media`) excludes blocked chats. A blocked message looks the same as a missing one. Send tools are unchanged.
 
-The file is re-read when it changes, so edits apply without a restart. If the file is missing, nothing is blocked. If it exists but can't be read, the read tools return an error instead of unfiltered data, and the bridge stores nothing until it is readable again.
+The file is re-read when it changes, so edits apply without a restart. If the file is missing, nothing is blocked. If it exists but can't be read or parsed, the read tools return an error instead of unfiltered data, and the bridge stores nothing until it is fixed.
 
-Notes:
+Messages stored before a chat was blocked stay in `whatsapp-bridge/store/messages.db`. The MCP server still hides them, but delete them from the database if you don't want them on disk.
 
-- A phone number matches the chat with that number (the user part of the chat JID). It does not hide that person's messages inside group chats; block the group itself if needed.
-- Some chats use privacy IDs (`...@lid`) instead of phone numbers. Block those by JID or by chat name.
-- Messages stored before a chat was blocked stay in `whatsapp-bridge/store/messages.db`. The MCP server still hides them, but delete them from the database if you don't want them on disk.
+## Sender names
+
+WhatsApp now identifies group participants by LID (for example `105506358227070@lid`) rather than phone number. The MCP server turns these into names using the bridge's whatsmeow store, `whatsapp-bridge/store/whatsapp.db`, which it opens read-only:
+
+1. A LID is mapped to the person's phone number (`whatsmeow_lid_map`).
+2. The name is the first one found, for either the LID or the phone number, in this order: your address-book name, first name, the name they set themselves (push name), then business name (`whatsmeow_contacts`).
+3. If none is found, the name of a 1:1 chat with that person is used, and failing that the raw ID.
+
+Your own messages still show as "Me". Messages returned by `get_message_context` and the chat tools include a `sender_name` or `last_sender_name` field, and 1:1 chats that were only named by number show the contact's name. `search_contacts` also finds people you only share groups with, and returns both their phone JID and LID. The `sender_phone_number` filter in `list_messages` accepts a phone number, phone JID or LID.
+
+Restart the MCP server (for Claude Desktop, quit and reopen it) to pick up these changes. Restart the bridge too: it then gives LID-keyed 1:1 chats real names when it stores them, and applies the LID/phone-aware blocking above before storing anything. Restarting the bridge does not require pairing again.
 
 ## Technical Details
 

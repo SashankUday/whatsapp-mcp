@@ -22,6 +22,9 @@ mcp = FastMCP("whatsapp")
 def search_contacts(query: str) -> List[Dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number.
     
+    Also finds people you only share groups with. Each result includes the
+    phone JID (jid) and, where known, the linked identity (lid).
+    
     Args:
         query: Search term to match against contact names or phone numbers
     """
@@ -46,7 +49,7 @@ def list_messages(
     Args:
         after: Optional ISO-8601 formatted string to only return messages after this date
         before: Optional ISO-8601 formatted string to only return messages before this date
-        sender_phone_number: Optional phone number to filter messages by sender
+        sender_phone_number: Optional sender to filter by: a phone number, phone JID or LID (e.g. "123@lid"); messages stored under any of that person's IDs match
         chat_jid: Optional chat JID to filter messages by chat
         query: Optional search term to filter messages by content
         limit: Maximum number of messages to return (default 20)
@@ -121,7 +124,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
     """Get all WhatsApp chats involving the contact.
     
     Args:
-        jid: The contact's JID to search for
+        jid: The contact's JID to search for (phone JID or LID)
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
@@ -133,7 +136,7 @@ def get_last_interaction(jid: str) -> str:
     """Get most recent WhatsApp message involving the contact.
     
     Args:
-        jid: The JID of the contact to search for
+        jid: The JID of the contact to search for (phone JID or LID)
     """
     message = whatsapp_get_last_interaction(jid)
     return message

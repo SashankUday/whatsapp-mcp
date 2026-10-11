@@ -13,12 +13,21 @@ import (
 //
 // The file lives at ../blocklist.txt (the repo root, since the bridge runs from
 // whatsapp-bridge/) unless WHATSAPP_MCP_BLOCKLIST is set. One entry per line,
-// '#' starts a comment. An entry is a phone number, an exact JID (contains '@'),
-// or a chat name ("name: <chat name>" or bare text, case-insensitive).
+// '#' starts a comment. Blocking is per chat and by ID only:
+//
+//   - a number (phone number or LID digits; spaces, '+', '-' and brackets are
+//     ignored) blocks the 1:1 chat with that person;
+//   - a JID blocks that chat: "<number>@s.whatsapp.net", "<lid>@lid" or a
+//     group "<id>@g.us".
+//
+// A person's phone JID and LID are the same chat; chatBlocked in main.go checks
+// both. Display names are never matched. Any line that isn't a number or a JID
+// makes the whole file invalid, which blocks everything, so a leftover name or
+// a mistyped number can't silently unblock a chat.
 //
 // The file is re-read on every check and reparsed when it changes, so edits
 // apply without a restart. A missing file blocks nothing; a file that exists
-// but can't be read blocks everything.
+// but can't be read or parsed blocks everything.
 
 const defaultBlocklistPath = "../blocklist.txt"
 
@@ -28,15 +37,10 @@ type blocklist struct {
 	path    string
 	content string
 	loaded  bool
-	failed  bool // file exists but could not be read: fail closed
+	failed  bool // file exists but could not be read or parsed: fail closed
 
-	phones map[string]bool
-	jids   map[string]bool
-	names  map[string]bool
-
-	// JIDs blocked because their chat name matched, so that later checks
-	// without a name (e.g. StoreMessage) still block them.
-	nameBlockedJIDs map[string]bool
+	numbers map[string]bool
+	jids    map[string]bool
 }
 
 var chatBlocklist = &blocklist{}
@@ -65,28 +69,22 @@ func normalizePhone(s string) string {
 	return b.String()
 }
 
-// jidUser returns the user part of a JID with any ":device" suffix removed.
-func jidUser(jid string) string {
-	user := jid
-	if i := strings.Index(user, "@"); i >= 0 {
-		user = user[:i]
-	}
-	if i := strings.Index(user, ":"); i >= 0 {
-		user = user[:i]
-	}
-	return user
+// normalizeJID lowercases a JID and strips any ":device" suffix from its user
+// part. It returns the user and server parts.
+func normalizeJID(jid string) (string, string) {
+	user, server, _ := strings.Cut(strings.ToLower(strings.TrimSpace(jid)), "@")
+	user, _, _ = strings.Cut(user, ":")
+	return user, server
 }
 
 func (bl *blocklist) reset() {
-	bl.phones = map[string]bool{}
+	bl.numbers = map[string]bool{}
 	bl.jids = map[string]bool{}
-	bl.names = map[string]bool{}
-	bl.nameBlockedJIDs = map[string]bool{}
 }
 
-func (bl *blocklist) parse(data []byte) {
+func (bl *blocklist) parse(data []byte) error {
 	scanner := bufio.NewScanner(bytes.NewReader(data))
-	for scanner.Scan() {
+	for lineNo := 1; scanner.Scan(); lineNo++ {
 		line := scanner.Text()
 		if i := strings.Index(line, "#"); i >= 0 {
 			line = line[:i]
@@ -95,18 +93,18 @@ func (bl *blocklist) parse(data []byte) {
 		if line == "" {
 			continue
 		}
-		if len(line) >= 5 && strings.EqualFold(line[:5], "name:") {
-			if name := strings.TrimSpace(line[5:]); name != "" {
-				bl.names[strings.ToLower(name)] = true
+		if strings.Contains(line, "@") {
+			if user, server := normalizeJID(line); user != "" && server != "" && !strings.Contains(line, " ") {
+				bl.jids[user+"@"+server] = true
+				continue
 			}
-		} else if strings.Contains(line, "@") {
-			bl.jids[strings.ToLower(line)] = true
-		} else if phone := normalizePhone(line); phone != "" {
-			bl.phones[phone] = true
-		} else {
-			bl.names[strings.ToLower(line)] = true
+		} else if number := normalizePhone(line); number != "" {
+			bl.numbers[number] = true
+			continue
 		}
+		return fmt.Errorf("line %d is not a phone number, LID or JID (names are not supported): %q", lineNo, line)
 	}
+	return nil
 }
 
 // refresh re-reads the file and reparses it if its contents changed. Reading
@@ -120,22 +118,28 @@ func (bl *blocklist) refresh() {
 			fmt.Printf("Blocklist %s could not be read, blocking all chats: %v\n", path, err)
 		}
 		bl.reset()
-		bl.path, bl.content, bl.loaded, bl.failed = path, "", true, true
+		// Not loaded: the next successful read must reparse, whatever its content
+		bl.path, bl.content, bl.loaded, bl.failed = path, "", false, true
 		return
 	}
 
 	// A missing file is treated as empty: nothing blocked
 	content := string(data)
-	if bl.loaded && !bl.failed && bl.path == path && bl.content == content {
+	if bl.loaded && bl.path == path && bl.content == content {
 		return
 	}
 	bl.reset()
 	bl.path, bl.content, bl.loaded, bl.failed = path, content, true, false
-	bl.parse(data)
+	if err := bl.parse(data); err != nil {
+		fmt.Printf("Blocklist %s is invalid, blocking all chats: %v\n", path, err)
+		bl.reset()
+		bl.failed = true
+	}
 }
 
-// IsBlocked reports whether a chat is on the blocklist. name may be empty.
-func IsBlocked(chatJID, name string) bool {
+// IsBlocked reports whether this exact chat JID is on the blocklist. Use
+// chatBlocked to also check a 1:1 chat's LID/phone alias.
+func IsBlocked(chatJID string) bool {
 	bl := chatBlocklist
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
@@ -145,18 +149,9 @@ func IsBlocked(chatJID, name string) bool {
 		return true
 	}
 
-	jid := strings.ToLower(chatJID)
-	if bl.jids[jid] || bl.nameBlockedJIDs[jid] {
+	user, server := normalizeJID(chatJID)
+	if bl.jids[user+"@"+server] {
 		return true
 	}
-	if user := jidUser(chatJID); user != "" && bl.phones[user] {
-		return true
-	}
-	if name != "" && bl.names[strings.ToLower(strings.TrimSpace(name))] {
-		if jid != "" {
-			bl.nameBlockedJIDs[jid] = true
-		}
-		return true
-	}
-	return false
+	return (server == "s.whatsapp.net" || server == "lid") && bl.numbers[user]
 }
