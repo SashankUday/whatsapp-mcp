@@ -183,8 +183,20 @@ The file is re-read when it changes, so edits apply without a restart. If the fi
 Notes:
 
 - A phone number matches the chat with that number (the user part of the chat JID). It does not hide that person's messages inside group chats; block the group itself if needed.
-- Some chats use privacy IDs (`...@lid`) instead of phone numbers. Block those by JID or by chat name.
+- Some 1:1 chats are keyed by a linked identity (LID, `...@lid`) instead of a phone number. A phone-number or name entry still blocks them: the LID is mapped to the phone number, and a name entry is checked against the person's contact names as well as the stored chat name.
 - Messages stored before a chat was blocked stay in `whatsapp-bridge/store/messages.db`. The MCP server still hides them, but delete them from the database if you don't want them on disk.
+
+## Sender names
+
+WhatsApp now identifies group participants by LID (for example `105506358227070@lid`) rather than phone number. The MCP server turns these into names using the bridge's whatsmeow store, `whatsapp-bridge/store/whatsapp.db`, which it opens read-only:
+
+1. A LID is mapped to the person's phone number (`whatsmeow_lid_map`).
+2. The name is the first one found, for either the LID or the phone number, in this order: your address-book name, first name, the name they set themselves (push name), then business name (`whatsmeow_contacts`).
+3. If none is found, the name of a 1:1 chat with that person is used, and failing that the raw ID.
+
+Your own messages still show as "Me". Messages returned by `get_message_context` and the chat tools include a `sender_name` or `last_sender_name` field, and 1:1 chats that were only named by number show the contact's name. `search_contacts` also finds people you only share groups with, and returns both their phone JID and LID. The `sender_phone_number` filter in `list_messages` accepts a phone number, phone JID or LID.
+
+Restart the MCP server (for Claude Desktop, quit and reopen it) to pick up these changes. Restart the bridge too: it then gives LID-keyed 1:1 chats real names when it stores them, and applies the LID-aware blocking above before storing anything. Restarting the bridge does not require pairing again.
 
 ## Technical Details
 
