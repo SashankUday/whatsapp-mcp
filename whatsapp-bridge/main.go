@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"math"
 	"math/rand"
@@ -13,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -808,6 +810,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 }
 
 func main() {
+	listGroups := flag.Bool("list-groups", false, "print the ID and name of every joined group, then exit (use it to find group IDs for blocklist.txt)")
+	flag.Parse()
+
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
@@ -924,6 +929,12 @@ func main() {
 		return
 	}
 
+	if *listGroups {
+		printJoinedGroups(client, logger)
+		client.Disconnect()
+		return
+	}
+
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
@@ -1000,6 +1011,19 @@ func chatBlocked(client *whatsmeow.Client, jid types.JID) bool {
 		}
 	}
 	return false
+}
+
+// printJoinedGroups prints "<group JID>\t<name>" for every joined group, sorted by name.
+func printJoinedGroups(client *whatsmeow.Client, logger waLog.Logger) {
+	groups, err := client.GetJoinedGroups(context.Background())
+	if err != nil {
+		logger.Errorf("Failed to get joined groups: %v", err)
+		return
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i].Name < groups[j].Name })
+	for _, group := range groups {
+		fmt.Printf("%s\t%s\n", group.JID, group.Name)
+	}
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info

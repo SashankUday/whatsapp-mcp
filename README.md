@@ -177,6 +177,7 @@ Blocking is per chat and by ID only:
 
 - A person's phone number and their linked identity (LID) are the same chat. WhatsApp keys some 1:1 chats by LID, so an entry in either form blocks the chat however it is stored (the bridge's `whatsmeow_lid_map` links the two). Listing both is safest.
 - Blocking a person does not hide their messages in group chats you haven't blocked. There they stay visible, with their name.
+- To find a group's ID, stop the bridge and run `cd whatsapp-bridge && go run . -list-groups`. It prints the ID and name of every group you're in, then exits. It can't run alongside the bridge, because both would use the same WhatsApp session.
 - Display names are not matched: names change and aren't unique. Any line that isn't a number or a JID (a name, or a mistyped number) makes the whole file invalid, and then everything is blocked until it is fixed, so a bad line can never quietly unblock a chat.
 
 What blocking does:
