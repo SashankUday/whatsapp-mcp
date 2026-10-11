@@ -104,17 +104,33 @@ def _load() -> _Entries:
         return _cache_entries
 
 
-def is_blocked(jid: Optional[str], name: Optional[str] = None) -> bool:
+def _matches(entries: _Entries, jid: Optional[str], name: Optional[str], resolver) -> bool:
+    """Match a chat by JID and name, and, given a resolver, by its alias JID and contact names.
+
+    The resolver (names.NameResolver) catches 1:1 chats keyed by a LID whose
+    stored chat name is only a number, which plain name entries would miss.
+    """
+    if entries.matches(jid, name):
+        return True
+    if resolver is None or not jid:
+        return False
+    if any(entries.matches(alias, None) for alias in resolver.aliases(jid)):
+        return True
+    return any(entries.matches(None, n) for n in resolver.contact_names(jid))
+
+
+def is_blocked(jid: Optional[str], name: Optional[str] = None, resolver=None) -> bool:
     """Whether a chat is blocked by JID, phone number or chat name."""
-    return _load().matches(jid, name)
+    return _matches(_load(), jid, name, resolver)
 
 
-def blocked_jids(cursor) -> Set[str]:
+def blocked_jids(cursor, resolver=None) -> Set[str]:
     """Resolve blocklist entries to the concrete chat JIDs in the database.
 
     Looks at both the chats table (JID and name) and the distinct chat_jid
     values in the messages table, so messages whose chat row is missing are
-    still excluded.
+    still excluded. With a resolver, a blocked person's other JID (LID or
+    phone) is excluded too.
     """
     entries = _load()
     if not (entries.phones or entries.jids or entries.names):
@@ -123,10 +139,13 @@ def blocked_jids(cursor) -> Set[str]:
     result = set(entries.jids)
     cursor.execute("SELECT jid, name FROM chats")
     for jid, name in cursor.fetchall():
-        if entries.matches(jid, name):
+        if _matches(entries, jid, name, resolver):
             result.add(jid)
     cursor.execute("SELECT DISTINCT chat_jid FROM messages")
     for (jid,) in cursor.fetchall():
-        if entries.matches(jid, None):
+        if _matches(entries, jid, None, resolver):
             result.add(jid)
+    if resolver is not None:
+        for jid in list(result):
+            result.update(resolver.aliases(jid))
     return result
