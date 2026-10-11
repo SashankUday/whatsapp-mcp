@@ -100,6 +100,9 @@ func (store *MessageStore) Close() error {
 
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
+	if IsBlocked(jid, name) {
+		return nil
+	}
 	_, err := store.db.Exec(
 		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
 		jid, name, lastMessageTime,
@@ -110,6 +113,10 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	if IsBlocked(chatJID, "") {
+		return nil
+	}
+
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
@@ -414,8 +421,18 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
 
+	// Skip blocked chats before name lookup, which logs the chat
+	if IsBlocked(chatJID, "") {
+		return
+	}
+
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+
+	// Skip blocked chats entirely: nothing is stored or printed
+	if IsBlocked(chatJID, name) {
+		return
+	}
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -560,6 +577,13 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
 	var fileLength uint64
 	var err error
+
+	// Refuse to download media from blocked chats
+	var chatName string
+	messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&chatName)
+	if IsBlocked(chatJID, chatName) {
+		return false, "", "", "", fmt.Errorf("chat is blocked")
+	}
 
 	// First, check if we already have this file
 	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
@@ -1025,8 +1049,18 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
+		// Skip blocked chats before name lookup, which logs the chat
+		if IsBlocked(chatJID, "") {
+			continue
+		}
+
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
+
+		// Skip blocked chats entirely
+		if IsBlocked(chatJID, name) {
+			continue
+		}
 
 		// Process messages
 		messages := conversation.Messages

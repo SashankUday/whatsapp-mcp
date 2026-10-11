@@ -159,6 +159,31 @@ You can send various media types to your WhatsApp contacts:
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
 
+## Blocking chats
+
+You can keep personal chats out of reach of the MCP server with a blocklist. Copy `blocklist.example.txt` to `blocklist.txt` in the repo root and list the chats to hide. `blocklist.txt` is git-ignored so your entries are never committed. To keep the file somewhere else, set `WHATSAPP_MCP_BLOCKLIST` to its path for both the bridge and the MCP server.
+
+```
+# One entry per line; '#' starts a comment
++44 7700 900000                  # phone number (spaces, +, -, brackets ignored)
+120363000000000000@g.us          # exact JID, individual or group
+name: Example Family Group       # chat name, case-insensitive exact match
+Example Friend                   # bare text is also a chat name
+```
+
+What blocking does:
+
+- **Go bridge**: messages and chat metadata from blocked chats are not stored in `messages.db` or printed to the console, and media downloads from them are refused.
+- **MCP server**: every read tool (`list_messages`, `list_chats`, `search_contacts`, `get_chat`, `get_contact_chats`, `get_last_interaction`, `get_direct_chat_by_contact`, `get_message_context`, `download_media`) excludes blocked chats. A blocked message looks the same as a missing one. Send tools are unchanged.
+
+The file is re-read when it changes, so edits apply without a restart. If the file is missing, nothing is blocked. If it exists but can't be read, the read tools return an error instead of unfiltered data, and the bridge stores nothing until it is readable again.
+
+Notes:
+
+- A phone number matches the chat with that number (the user part of the chat JID). It does not hide that person's messages inside group chats; block the group itself if needed.
+- Some chats use privacy IDs (`...@lid`) instead of phone numbers. Block those by JID or by chat name.
+- Messages stored before a chat was blocked stay in `whatsapp-bridge/store/messages.db`. The MCP server still hides them, but delete them from the database if you don't want them on disk.
+
 ## Technical Details
 
 1. Claude sends requests to the Python MCP server

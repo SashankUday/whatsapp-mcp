@@ -1,0 +1,19 @@
+# Chat blocklist for whatsapp-mcp
+#
+# Copy this file to blocklist.txt (which is git-ignored) and list the chats
+# that must never be read through the MCP server. Set WHATSAPP_MCP_BLOCKLIST
+# to use a different path. Edits apply without restarting anything.
+#
+# One entry per line; '#' starts a comment. All entries below are fake.
+
+# Phone number: spaces, '+', '-' and brackets are ignored
++1 (555) 010-0199
+44 7700 900000
+
+# Exact JID: an individual chat or a group
+15550100198@s.whatsapp.net
+120363000000000000@g.us
+
+# Chat name, case-insensitive exact match ("name:" prefix or bare text)
+name: Example Family Group
+Example Friend
