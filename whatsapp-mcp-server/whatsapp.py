@@ -1,8 +1,11 @@
 import sqlite3
 from datetime import datetime
-from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, List, Tuple, Dict, Any
 import os.path
+import secrets
+import threading
+import time
 import requests
 import json
 import audio
@@ -29,6 +32,8 @@ class Message:
     chat_name: Optional[str] = None
     media_type: Optional[str] = None
     sender_name: Optional[str] = None
+    read_state: Optional[str] = None  # "read", "unread" or "unknown"
+    dismissed: bool = False  # dismissed locally (never sent to WhatsApp)
 
 @dataclass
 class Chat:
@@ -39,6 +44,8 @@ class Chat:
     last_sender: Optional[str] = None
     last_is_from_me: Optional[bool] = None
     last_sender_name: Optional[str] = None
+    unread_count: Optional[int] = None  # incoming unread messages not dismissed; None if not tracked
+    marked_unread: Optional[bool] = None  # chat marked unread on another device
 
     @property
     def is_group(self) -> bool:
@@ -74,8 +81,37 @@ def get_sender_name(sender_jid: str, resolver: Optional[NameResolver] = None) ->
         print(f"Error getting sender name: {e}")
         return sender_jid
 
+def _has_read_state(cursor) -> bool:
+    """Whether the bridge has added read-state tracking to messages.db."""
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(messages)").fetchall()}
+    return {"read_state", "dismissed_at"} <= columns
+
+def _require_read_state(cursor) -> None:
+    if not _has_read_state(cursor):
+        raise ValueError("Read-state tracking isn't available yet: rebuild and restart the WhatsApp bridge first.")
+
+def _read_cols(cursor, table: str = "messages") -> str:
+    """Read-state columns to append to a message SELECT, or placeholders before the bridge migrates."""
+    if _has_read_state(cursor):
+        return f"{table}.read_state, {table}.dismissed_at"
+    return "'unknown', NULL"
+
+def _chat_unread_info(cursor, jids) -> Dict[str, Tuple[int, bool]]:
+    """Unread count (incoming, not dismissed) and marked-unread flag per chat JID."""
+    jids = list(dict.fromkeys(jids))
+    if not jids or not _has_read_state(cursor):
+        return {}
+    in_sql, params = _in("chat_jid", jids)
+    counts = dict(cursor.execute(
+        f"""SELECT chat_jid, COUNT(*) FROM messages
+            WHERE {in_sql} AND is_from_me = 0 AND read_state = 'unread' AND dismissed_at IS NULL
+            GROUP BY chat_jid""", params).fetchall())
+    marked = dict(cursor.execute(
+        f"SELECT chat_jid, marked_unread FROM chat_read_state WHERE {in_sql}", params).fetchall())
+    return {j: (counts.get(j, 0), bool(marked.get(j, 0))) for j in jids}
+
 def _message_from_row(row, resolver: NameResolver) -> Message:
-    """Build a Message from (timestamp, sender, chat name, content, is_from_me, chat jid, id, media_type)."""
+    """Build a Message from (timestamp, sender, chat name, content, is_from_me, chat jid, id, media_type[, read_state, dismissed_at])."""
     message = Message(
         timestamp=datetime.fromisoformat(row[0]),
         sender=row[1],
@@ -87,9 +123,12 @@ def _message_from_row(row, resolver: NameResolver) -> Message:
         media_type=row[7]
     )
     message.sender_name = "Me" if message.is_from_me else get_sender_name(message.sender, resolver)
+    if len(row) >= 10:
+        message.read_state = row[8] or "unknown"
+        message.dismissed = row[9] is not None
     return message
 
-def _chat_from_row(row, resolver: NameResolver) -> Chat:
+def _chat_from_row(row, resolver: NameResolver, unread: Optional[Dict[str, Tuple[int, bool]]] = None) -> Chat:
     """Build a Chat from (jid, name, last_message_time, last message, last sender, last_is_from_me)."""
     chat = Chat(
         jid=row[0],
@@ -103,7 +142,17 @@ def _chat_from_row(row, resolver: NameResolver) -> Chat:
         chat.last_sender_name = "Me"
     elif chat.last_sender:
         chat.last_sender_name = get_sender_name(chat.last_sender, resolver)
+    if unread is not None and chat.jid in unread:
+        chat.unread_count, chat.marked_unread = unread[chat.jid]
     return chat
+
+def _chats_from_rows(cursor, rows, resolver: NameResolver) -> List[Chat]:
+    unread = _chat_unread_info(cursor, [row[0] for row in rows])
+    return [_chat_from_row(row, resolver, unread) for row in rows]
+
+def _read_tag(message: Message) -> str:
+    state = message.read_state or "unknown"
+    return f"{state}, dismissed" if message.dismissed else state
 
 def _person_jids(jid: str, resolver: NameResolver) -> List[str]:
     """A person's JID plus their LID or phone JID, for matching chats and senders."""
@@ -123,9 +172,9 @@ def format_message(message: Message, show_chat_info: bool = True, resolver: Opti
     
     chat_name = resolver.chat_display_name(message.chat_jid, message.chat_name)
     if show_chat_info and chat_name:
-        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {chat_name} "
+        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] [{_read_tag(message)}] Chat: {chat_name} "
     else:
-        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
+        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] [{_read_tag(message)}] "
         
     content_prefix = ""
     if hasattr(message, 'media_type') and message.media_type:
@@ -159,12 +208,14 @@ def list_messages(
     page: int = 0,
     include_context: bool = True,
     context_before: int = 1,
-    context_after: int = 1
+    context_after: int = 1,
+    unread_only: bool = False
 ) -> List[Message]:
     """Get messages matching the specified criteria with optional context.
 
     sender_phone_number may be a phone number, a phone JID or a LID; messages
-    stored under any of that person's IDs match.
+    stored under any of that person's IDs match. unread_only keeps incoming
+    messages that are unread and not dismissed.
     """
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
@@ -173,7 +224,9 @@ def list_messages(
         blocked = blocked_jids(cursor, resolver)
         
         # Build base query
-        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"]
+        if unread_only:
+            _require_read_state(cursor)
+        query_parts = [f"SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, {_read_cols(cursor)} FROM messages"]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         excl_sql, excl_params = _not_in("messages.chat_jid", blocked)
         where_clauses = [excl_sql]
@@ -210,6 +263,9 @@ def list_messages(
         if query:
             where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
             params.append(f"%{query}%")
+
+        if unread_only:
+            where_clauses.append("messages.is_from_me = 0 AND messages.read_state = 'unread' AND messages.dismissed_at IS NULL")
             
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
@@ -247,10 +303,11 @@ def list_messages(
 
 def _get_message_context(cursor, message_id: str, before: int, after: int, blocked, resolver: NameResolver) -> MessageContext:
     """Context around a message, using an open cursor and a precomputed blocked set."""
+    read_cols = _read_cols(cursor)
     # Get the target message first (blocked chats look like a missing message)
     excl_sql, excl_params = _not_in("messages.chat_jid", blocked)
     cursor.execute(f"""
-        SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+        SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, {read_cols}
         FROM messages
         JOIN chats ON messages.chat_jid = chats.jid
         WHERE messages.id = ? AND {excl_sql}
@@ -263,8 +320,8 @@ def _get_message_context(cursor, message_id: str, before: int, after: int, block
     target_message = _message_from_row(msg_data, resolver)
     
     # Get messages before
-    cursor.execute("""
-        SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+    cursor.execute(f"""
+        SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, {read_cols}
         FROM messages
         JOIN chats ON messages.chat_jid = chats.jid
         WHERE messages.chat_jid = ? AND messages.timestamp < ?
@@ -274,8 +331,8 @@ def _get_message_context(cursor, message_id: str, before: int, after: int, block
     before_messages = [_message_from_row(msg, resolver) for msg in cursor.fetchall()]
     
     # Get messages after
-    cursor.execute("""
-        SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type
+    cursor.execute(f"""
+        SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, {read_cols}
         FROM messages
         JOIN chats ON messages.chat_jid = chats.jid
         WHERE messages.chat_jid = ? AND messages.timestamp > ?
@@ -369,7 +426,7 @@ def list_chats(
         params.extend([limit, offset])
         
         cursor.execute(" ".join(query_parts), tuple(params))
-        return [_chat_from_row(chat_data, resolver) for chat_data in cursor.fetchall()]
+        return _chats_from_rows(cursor, cursor.fetchall(), resolver)
         
     except sqlite3.Error as e:
         print(f"Database error: {e}")
@@ -472,7 +529,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
             LIMIT ? OFFSET ?
         """, (*sender_params, *chat_params, *excl_params, limit, page * limit))
         
-        return [_chat_from_row(chat_data, resolver) for chat_data in cursor.fetchall()]
+        return _chats_from_rows(cursor, cursor.fetchall(), resolver)
         
     except sqlite3.Error as e:
         print(f"Database error: {e}")
@@ -501,7 +558,8 @@ def get_last_interaction(jid: str) -> str:
                 m.is_from_me,
                 c.jid,
                 m.id,
-                m.media_type
+                m.media_type,
+                {_read_cols(cursor, "m")}
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
             WHERE ({sender_sql} OR {chat_sql}) AND {excl_sql}
@@ -556,7 +614,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         if not chat_data or is_blocked(chat_data[0], resolver):
             return None
             
-        return _chat_from_row(chat_data, resolver)
+        return _chats_from_rows(cursor, [chat_data], resolver)[0]
         
     except sqlite3.Error as e:
         print(f"Database error: {e}")
@@ -596,7 +654,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if not chat_data:
             return None
             
-        return _chat_from_row(chat_data, resolver)
+        return _chats_from_rows(cursor, [chat_data], resolver)[0]
         
     except sqlite3.Error as e:
         print(f"Database error: {e}")
@@ -604,6 +662,235 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     finally:
         if 'conn' in locals():
             conn.close()
+
+def _visible_chat(cursor, chat_jid: str, resolver: NameResolver) -> Optional[Tuple[str, Optional[str]]]:
+    """(jid, display name) of a chat the tools may touch; None if it's missing or blocked.
+
+    Blocked and missing chats look the same, so a refusal doesn't reveal that a
+    blocked chat exists.
+    """
+    if not chat_jid or is_blocked(chat_jid, resolver):
+        return None
+    row = cursor.execute("SELECT jid, name FROM chats WHERE jid = ?", (chat_jid,)).fetchone()
+    if not row:
+        return None
+    return row[0], resolver.chat_display_name(row[0], row[1])
+
+def _chat_forms(chat_jid: str, resolver: NameResolver) -> List[str]:
+    """A chat's JID plus, for 1:1 chats, its LID/phone alias (messages may be stored under either)."""
+    return [chat_jid] + (resolver.aliases(chat_jid) if not chat_jid.endswith("@g.us") else [])
+
+
+def list_unread_messages(limit_per_chat: int = 50, include_marked_unread: bool = True) -> List[Dict[str, Any]]:
+    """Unread incoming messages across chats, grouped by chat, oldest first.
+
+    Only messages known to be unread count: messages stored before read-state
+    tracking existed are "unknown" and left out, as are dismissed messages and
+    blocked chats. Chats marked unread on another device appear even when no
+    stored message is unread.
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        _require_read_state(cursor)
+        resolver = _resolver()
+        blocked = blocked_jids(cursor, resolver)
+        excl_sql, excl_params = _not_in("m.chat_jid", blocked)
+        cursor.execute(f"""
+            SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me, c.jid, m.id, m.media_type, m.read_state, m.dismissed_at
+            FROM messages m
+            JOIN chats c ON m.chat_jid = c.jid
+            WHERE m.is_from_me = 0 AND m.read_state = 'unread' AND m.dismissed_at IS NULL AND {excl_sql}
+            ORDER BY CAST(strftime('%s', m.timestamp) AS INTEGER) ASC
+        """, excl_params)
+
+        groups: Dict[str, Dict[str, Any]] = {}
+        for row in cursor.fetchall():
+            message = _message_from_row(row, resolver)
+            group = groups.setdefault(message.chat_jid, {
+                "chat_jid": message.chat_jid,
+                "chat_name": message.chat_name,
+                "unread_count": 0,
+                "marked_unread": False,
+                "messages": [],
+            })
+            group["unread_count"] += 1
+            if len(group["messages"]) < limit_per_chat:
+                group["messages"].append({
+                    "id": message.id,
+                    "timestamp": message.timestamp.isoformat(),
+                    "sender": message.sender,
+                    "sender_name": message.sender_name,
+                    "content": message.content,
+                    "media_type": message.media_type,
+                })
+
+        excl_sql, excl_params = _not_in("s.chat_jid", blocked)
+        for jid, name in cursor.execute(f"""
+            SELECT s.chat_jid, c.name FROM chat_read_state s JOIN chats c ON c.jid = s.chat_jid
+            WHERE s.marked_unread = 1 AND {excl_sql}
+        """, excl_params).fetchall():
+            if jid in groups:
+                groups[jid]["marked_unread"] = True
+            elif include_marked_unread:
+                groups[jid] = {"chat_jid": jid, "chat_name": resolver.chat_display_name(jid, name),
+                               "unread_count": 0, "marked_unread": True, "messages": []}
+
+        for group in groups.values():
+            group["truncated"] = group["unread_count"] > len(group["messages"])
+        return list(groups.values())
+
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+def dismiss_messages(chat_jid: str, message_ids: Optional[List[str]] = None, undo: bool = False) -> Dict[str, Any]:
+    """Dismiss messages locally so they drop out of unread listings, or undo that.
+
+    Only a local flag in messages.db changes: nothing is sent to WhatsApp and
+    nobody sees anything. Without message_ids, dismisses every unread incoming
+    message in the chat (or, with undo, restores every dismissed one).
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH, timeout=10)
+        cursor = conn.cursor()
+        _require_read_state(cursor)
+        resolver = _resolver()
+        chat = _visible_chat(cursor, chat_jid, resolver)
+        if chat is None:
+            raise ValueError(f"Chat not found: {chat_jid}")
+        forms_sql, forms_params = _in("chat_jid", _chat_forms(chat[0], resolver))
+        ids_sql, ids_params = _in("id", message_ids) if message_ids else ("1=1", [])
+
+        if undo:
+            cursor.execute(f"""UPDATE messages SET dismissed_at = NULL
+                WHERE {forms_sql} AND {ids_sql} AND dismissed_at IS NOT NULL""", (*forms_params, *ids_params))
+        else:
+            unread_only = "1=1" if message_ids else "read_state = 'unread'"
+            cursor.execute(f"""UPDATE messages SET dismissed_at = ?
+                WHERE {forms_sql} AND {ids_sql} AND {unread_only} AND is_from_me = 0 AND dismissed_at IS NULL""",
+                (int(time.time()), *forms_params, *ids_params))
+        changed = cursor.rowcount
+        conn.commit()
+        return {
+            "chat_jid": chat[0],
+            "chat_name": chat[1],
+            ("restored" if undo else "dismissed"): changed,
+            "note": "Local only: nothing was sent to WhatsApp. Undo with undo=true.",
+        }
+
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+# Pending mark-read confirmations: token -> (expiry, chat list, {chat_jid: [message ids]})
+_MARK_READ_TOKEN_TTL = 300
+_mark_read_tokens: Dict[str, Tuple[float, Tuple[str, ...], Dict[str, List[str]]]] = {}
+_mark_read_lock = threading.Lock()
+
+_BLUE_TICK_WARNING = ("This sends read receipts to WhatsApp. Your phone and other devices will show these "
+                      "messages as read, and if you have read receipts switched on, the senders may see blue ticks. "
+                      "It can't be undone.")
+
+
+def mark_read_on_whatsapp(chat_jids: List[str], confirmation_token: Optional[str] = None,
+                          confirm_multiple_chats: bool = False) -> Dict[str, Any]:
+    """Mark unread messages read on WhatsApp itself, in two steps.
+
+    Without a token this is a dry run: it reports which chats and how many
+    messages per chat would be marked, and returns a short-lived single-use
+    confirmation token. Only a second call with that token and the same chat
+    list sends anything. Blocked chats are refused, and more than one chat
+    needs confirm_multiple_chats=True.
+    """
+    chats_requested = tuple(dict.fromkeys(j.strip() for j in (chat_jids or []) if j and j.strip()))
+    if not chats_requested:
+        raise ValueError("chat_jids must list at least one chat")
+    if len(chats_requested) > 1 and not confirm_multiple_chats:
+        raise ValueError("Only one chat per call. To mark several, list them explicitly and set confirm_multiple_chats=true.")
+
+    if confirmation_token:
+        with _mark_read_lock:
+            now = time.time()
+            for token, (expiry, _, _) in list(_mark_read_tokens.items()):
+                if expiry < now:
+                    del _mark_read_tokens[token]
+            pending = _mark_read_tokens.pop(confirmation_token, None)
+        if pending is None:
+            raise ValueError("Invalid or expired confirmation token. Run again without a token for a new dry run.")
+        _, token_chats, plan = pending
+        if token_chats != chats_requested:
+            raise ValueError("The chat list doesn't match the dry run this token was issued for. Run a new dry run.")
+        return _send_mark_read(plan)
+
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        _require_read_state(cursor)
+        resolver = _resolver()
+        plan: Dict[str, List[str]] = {}
+        summary = []
+        for requested in chats_requested:
+            chat = _visible_chat(cursor, requested, resolver)
+            if chat is None:
+                raise ValueError(f"Chat not found: {requested}")
+            forms_sql, forms_params = _in("chat_jid", _chat_forms(chat[0], resolver))
+            rows = cursor.execute(f"""
+                SELECT chat_jid, id, timestamp FROM messages
+                WHERE {forms_sql} AND is_from_me = 0 AND read_state = 'unread'
+                ORDER BY CAST(strftime('%s', timestamp) AS INTEGER)""", forms_params).fetchall()
+            for stored_chat, message_id, _ in rows:
+                plan.setdefault(stored_chat, []).append(message_id)
+            summary.append({
+                "chat_jid": chat[0],
+                "chat_name": chat[1],
+                "messages_to_mark": len(rows),
+                "oldest": rows[0][2] if rows else None,
+                "newest": rows[-1][2] if rows else None,
+            })
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+    total = sum(c["messages_to_mark"] for c in summary)
+    result: Dict[str, Any] = {"dry_run": True, "chats": summary, "total_messages": total}
+    if total == 0:
+        result["message"] = "Nothing to mark: no unread messages in these chats."
+        return result
+    token = secrets.token_urlsafe(16)
+    with _mark_read_lock:
+        _mark_read_tokens[token] = (time.time() + _MARK_READ_TOKEN_TTL, chats_requested, plan)
+    result.update({
+        "warning": _BLUE_TICK_WARNING,
+        "confirmation_token": token,
+        "expires_in_seconds": _MARK_READ_TOKEN_TTL,
+        "next_step": "Only if the user explicitly confirms, call again with the same chat_jids and this confirmation_token.",
+    })
+    return result
+
+
+def _send_mark_read(plan: Dict[str, List[str]]) -> Dict[str, Any]:
+    """Ask the bridge to send read receipts for a confirmed plan."""
+    resolver = _resolver()
+    results = []
+    for chat_jid, message_ids in plan.items():
+        # The blocklist may have changed since the dry run
+        if is_blocked(chat_jid, resolver):
+            results.append({"chat_jid": chat_jid, "success": False, "message": "Chat not found"})
+            continue
+        try:
+            response = requests.post(f"{WHATSAPP_API_BASE_URL}/mark-read",
+                                     json={"chat_jid": chat_jid, "message_ids": message_ids}, timeout=60)
+            body = response.json()
+            results.append({"chat_jid": chat_jid, "success": bool(body.get("success")),
+                            "marked": body.get("marked", 0), "message": body.get("message", "")})
+        except (requests.RequestException, ValueError) as e:
+            results.append({"chat_jid": chat_jid, "success": False, "message": f"Bridge request failed: {e}"})
+    return {"dry_run": False, "results": results,
+            "total_marked": sum(r.get("marked", 0) for r in results if r["success"])}
+
 
 def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     try:
